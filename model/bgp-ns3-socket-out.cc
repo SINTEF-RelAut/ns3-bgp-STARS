@@ -27,8 +27,8 @@ BgpNs3SocketOut::BgpNs3SocketOut (Ptr<Socket> socket,
   _disconnected = false;
   _state_change_cb = state_change_cb;
   _mrai = Seconds (0);
+  _next_pending_seq = 0;
   _next_update_send_time = Seconds (0);
-  _has_pending_update = false;
 }
 
 /**
@@ -80,7 +80,7 @@ BgpNs3SocketOut::handleOut (const uint8_t *buffer, size_t length)
   if (_mrai > Seconds (0) && type == 2)
     {
       Time now = Simulator::Now ();
-      if (now >= _next_update_send_time && !_has_pending_update)
+      if (now >= _next_update_send_time && _pending_updates.empty ())
         {
           bool sent_now = socket->Send (buffer, length, 0) == (int) length;
           if (sent_now)
@@ -94,12 +94,54 @@ BgpNs3SocketOut::handleOut (const uint8_t *buffer, size_t length)
           return sent_now;
         }
 
-      // Coalesce UPDATE bursts to a single pending message to keep memory bounded.
-      _pending_update.bytes.assign (buffer, buffer + length);
-      _pending_update.type = type;
-      _pending_update.has_nlri = has_nlri;
-      _pending_update.has_withdrawals = has_withdrawals;
-      _has_pending_update = true;
+      // MRAI queue compression: keep the latest pending UPDATE per prefix. Prefixes this
+      // message re-advertises drop their earlier pending message; prefixes it does not
+      // mention keep theirs. Compressing per peer instead of per prefix, as this used to,
+      // silently discards the routes of every prefix absent from the newest message.
+      PendingMessage pending;
+      pending.bytes.assign (buffer, buffer + length);
+      pending.type = type;
+      pending.has_nlri = has_nlri;
+      pending.has_withdrawals = has_withdrawals;
+
+      const uint64_t seq = _next_pending_seq++;
+      const std::vector<PrefixKey> prefixes = ExtractPrefixes (buffer, length);
+      for (std::vector<PrefixKey>::const_iterator it = prefixes.begin (); it != prefixes.end ();
+           ++it)
+        {
+          std::map<PrefixKey, uint64_t>::iterator prev = _pending_seq_by_prefix.find (*it);
+          if (prev != _pending_seq_by_prefix.end ())
+            {
+              // Superseded for this prefix. Retire the old message only once no prefix
+              // still refers to it, otherwise a message covering several prefixes would
+              // vanish when just one of them is re-advertised.
+              const uint64_t old_seq = prev->second;
+              prev->second = seq;
+              bool still_referenced = false;
+              for (std::map<PrefixKey, uint64_t>::const_iterator scan =
+                       _pending_seq_by_prefix.begin ();
+                   scan != _pending_seq_by_prefix.end (); ++scan)
+                {
+                  if (scan->second == old_seq)
+                    {
+                      still_referenced = true;
+                      break;
+                    }
+                }
+              if (!still_referenced)
+                {
+                  _pending_updates.erase (old_seq);
+                }
+            }
+          else
+            {
+              _pending_seq_by_prefix.insert (std::make_pair (*it, seq));
+            }
+        }
+
+      // An UPDATE with no prefixes at all (attribute-only) still has to reach the peer.
+      _pending_updates.insert (std::make_pair (seq, pending));
+
       ScheduleUpdateFlush ();
       return true;
     }
@@ -159,14 +201,15 @@ BgpNs3SocketOut::DisconnectSocket ()
     {
       _update_flush_event.Cancel ();
     }
-  _has_pending_update = false;
+  _pending_seq_by_prefix.clear ();
+  _pending_updates.clear ();
   _socket = nullptr;
 }
 
 void
 BgpNs3SocketOut::ScheduleUpdateFlush ()
 {
-  if (!_has_pending_update || _update_flush_event.IsRunning ())
+  if (_pending_updates.empty () || _update_flush_event.IsRunning ())
     {
       return;
     }
@@ -187,17 +230,8 @@ BgpNs3SocketOut::ScheduleUpdateFlush ()
 void
 BgpNs3SocketOut::FlushPendingUpdate ()
 {
-  if (!_has_pending_update)
+  if (_pending_updates.empty ())
     {
-      return;
-    }
-
-  PendingMessage msg = _pending_update;
-  _has_pending_update = false;
-
-  if (_socket == nullptr)
-    {
-      _disconnected = true;
       return;
     }
 
@@ -208,21 +242,89 @@ BgpNs3SocketOut::FlushPendingUpdate ()
       return;
     }
 
-  bool sent = socket->Send (msg.bytes.data (), msg.bytes.size (), 0) == (int) msg.bytes.size ();
-  if (sent)
+  // One MRAI tick releases the compressed state: the surviving latest UPDATE for every
+  // prefix still pending, in the order libbgp produced them so the peer ends on the
+  // correct final state. Everything superseded during the window was already dropped.
+  std::map<uint64_t, PendingMessage> due;
+  due.swap (_pending_updates);
+  _pending_seq_by_prefix.clear ();
+
+  for (std::map<uint64_t, PendingMessage>::const_iterator it = due.begin (); it != due.end ();
+       ++it)
     {
-      if (!_msg_cb.IsNull ())
+      const PendingMessage &msg = it->second;
+      bool sent =
+          socket->Send (msg.bytes.data (), msg.bytes.size (), 0) == (int) msg.bytes.size ();
+      if (sent && !_msg_cb.IsNull ())
         {
           _msg_cb (socket, msg.type, msg.bytes.size (), msg.has_nlri, msg.has_withdrawals);
         }
-      _next_update_send_time = Simulator::Now () + _mrai;
     }
 
-  if (_has_pending_update)
+  _next_update_send_time = Simulator::Now () + _mrai;
+}
+
+/**
+ * @brief Collect every prefix a BGP UPDATE touches.
+ *
+ * Walks the withdrawn-routes list and the NLRI list, both of which encode each prefix as a
+ * one-byte length in bits followed by ceil(len/8) bytes of network-order address. Used to
+ * key MRAI queue compression, so a re-advertisement only supersedes the pending message for
+ * the prefixes it actually carries.
+ *
+ * @param buffer Raw BGP message.
+ * @param length Message length in bytes.
+ * @return The prefixes referenced, as (prefix length, address) pairs.
+ */
+std::vector<BgpNs3SocketOut::PrefixKey>
+BgpNs3SocketOut::ExtractPrefixes (const uint8_t *buffer, size_t length)
+{
+  std::vector<PrefixKey> prefixes;
+  if (length < 23 || buffer[18] != 2)
     {
-      _update_flush_event = Simulator::Schedule (_mrai, &BgpNs3SocketOut::FlushPendingUpdate,
-                                                 Ptr<BgpNs3SocketOut> (this));
+      return prefixes;
     }
+
+  const uint16_t withdrawn_len = (uint16_t) ((buffer[19] << 8) | buffer[20]);
+  const size_t path_attr_offset = 21 + withdrawn_len;
+  if (path_attr_offset + 2 > length)
+    {
+      return prefixes;
+    }
+
+  const uint16_t path_attr_len =
+      (uint16_t) ((buffer[path_attr_offset] << 8) | buffer[path_attr_offset + 1]);
+  const size_t nlri_offset = path_attr_offset + 2 + path_attr_len;
+
+  const size_t ranges[2][2] = {{21, path_attr_offset}, {nlri_offset, length}};
+  for (uint32_t r = 0; r < 2; ++r)
+    {
+      size_t pos = ranges[r][0];
+      const size_t end = ranges[r][1] > length ? length : ranges[r][1];
+      while (pos < end)
+        {
+          const uint8_t bits = buffer[pos];
+          if (bits > 32)
+            {
+              break;
+            }
+          const size_t octets = (bits + 7) / 8;
+          if (pos + 1 + octets > end)
+            {
+              break;
+            }
+
+          uint32_t addr = 0;
+          for (size_t b = 0; b < octets; ++b)
+            {
+              addr |= ((uint32_t) buffer[pos + 1 + b]) << (24 - 8 * b);
+            }
+          prefixes.push_back (std::make_pair (bits, addr));
+          pos += 1 + octets;
+        }
+    }
+
+  return prefixes;
 }
 
 } // namespace ns3

@@ -12,6 +12,7 @@
 #define BGP_NS3_SOCKET_OUT_H
 
 #include <libbgp/bgp-out-handler.h>
+#include <map>
 #include <vector>
 #include "ns3/socket.h"
 #include "ns3/simple-ref-count.h"
@@ -47,8 +48,13 @@ private:
     bool has_withdrawals;
   };
 
+  // A prefix as carried in an UPDATE: (prefix length in bits, up to 4 network-order bytes).
+  typedef std::pair<uint8_t, uint32_t> PrefixKey;
+
   void ScheduleUpdateFlush ();
   void FlushPendingUpdate ();
+  // Extract every prefix an UPDATE touches, from both its withdrawn-routes and NLRI lists.
+  static std::vector<PrefixKey> ExtractPrefixes (const uint8_t *buffer, size_t length);
 
   Ptr<Socket> _socket;
   bool _disconnected;
@@ -57,8 +63,15 @@ private:
   Time _mrai;
   Time _next_update_send_time;
   EventId _update_flush_event;
-  bool _has_pending_update;
-  PendingMessage _pending_update;
+  // MRAI queue compression: while the timer runs, hold the latest pending UPDATE per
+  // prefix. A repeated advertisement for the same prefix replaces the earlier one, which
+  // is the point of MRAI, but advertisements for different prefixes each survive. The old
+  // implementation kept one slot for the whole peer, so a burst collapsed to its last
+  // message and every other prefix's route was lost - libbgp is told the write succeeded
+  // and never retries.
+  std::map<PrefixKey, uint64_t> _pending_seq_by_prefix;
+  std::map<uint64_t, PendingMessage> _pending_updates;
+  uint64_t _next_pending_seq;
 };
 
 } // namespace ns3
