@@ -285,9 +285,13 @@ Bgp::ConnectPeer (Ptr<Peer> peer)
   if (peer->local_asn != peer->peer_asn)
     peer_socket->SetIpTtl (peer->ebgp_multihop);
 
+  _pending_connects[peer_socket] = peer;
+
   if (peer_socket->Connect (InetSocketAddress (peer->peer_address, 179)) == -1)
     {
       NS_LOG_ERROR ("failed to connect: " << strerror (errno));
+      _pending_connects.erase (peer_socket);
+      RetryPeerLater (peer);
       return false;
     }
 
@@ -304,6 +308,34 @@ void
 Bgp::HandleConnectOutFailed (Ptr<Socket> socket)
 {
   NS_LOG_WARN ("socket connect failed: " << socket);
+
+  // A Session is only created once the connect succeeds, so a failed connect leaves no
+  // session behind and HandleClose - the only other place that schedules a retry - never
+  // runs for this peer. Without retrying here, the first connect attempt that lands while
+  // the link is down silently retires the peer for the rest of the run, and the session
+  // never returns even after the link comes back up.
+  std::map<Ptr<Socket>, Ptr<Peer>>::iterator it = _pending_connects.find (socket);
+  if (it == _pending_connects.end ())
+    {
+      return;
+    }
+
+  Ptr<Peer> peer = it->second;
+  _pending_connects.erase (it);
+  socket->Close ();
+  RetryPeerLater (peer);
+}
+
+void
+Bgp::RetryPeerLater (Ptr<Peer> peer)
+{
+  if (!_running || peer->passive)
+    {
+      return;
+    }
+
+  NS_LOG_LOGIC ("scheduled connect retry in " << _error_hold.GetSeconds () << " seconds.");
+  Simulator::Schedule (_error_hold, &Bgp::ConnectPeer, this, peer);
 }
 
 void
@@ -346,6 +378,7 @@ Bgp::HandleConnectOut (Ptr<Socket> socket)
   NS_LOG_LOGIC ("connected. unregister connect callback...");
   socket->SetConnectCallback (MakeNullCallback<void, Ptr<Socket>> (),
                               MakeNullCallback<void, Ptr<Socket>> ());
+  _pending_connects.erase (socket);
   SessionInit (true, socket);
 }
 

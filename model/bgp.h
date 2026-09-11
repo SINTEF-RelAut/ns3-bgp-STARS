@@ -12,6 +12,7 @@
 #define BGP_H
 
 #include <fstream>
+#include <map>
 #include <vector>
 #include "bgp-ns3-fsm.h"
 #include "bgp-ns3-clock.h"
@@ -108,6 +109,8 @@ private:
   bool HandleConnectInRequest (Ptr<Socket> socket, const Address &src);
   void HandleConnectOut (Ptr<Socket> socket);
   void HandleConnectOutFailed (Ptr<Socket> socket);
+  // Schedule another ConnectPeer for a peer whose outbound connect failed.
+  void RetryPeerLater (Ptr<Peer> peer);
   void HandleClose (Ptr<Socket> socket);
   void HandleStateChange (Ptr<Socket> socket, int old_state, int new_state);
   void CloseSocket (Ptr<Socket> socket);
@@ -128,6 +131,9 @@ private:
 
   std::vector<Ptr<Peer>> _peers;
   std::vector<Ptr<Session>> _sessions;
+  // Outbound sockets whose TCP connect has not completed yet. A Session only exists once
+  // the connect succeeds, so without this a failed connect leaves nothing to retry from.
+  std::map<Ptr<Socket>, Ptr<Peer>> _pending_connects;
 
   libbgp::BgpConfig _template;
   libbgp::BgpRib4 _rib;
