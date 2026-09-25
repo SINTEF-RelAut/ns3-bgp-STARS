@@ -366,6 +366,86 @@ Bgp::HandleClose (Ptr<Socket> socket)
 }
 
 void
+Bgp::DropSessionsToPeer (const Ipv4Address &peer_address)
+{
+  for (std::vector<Ptr<Session>>::iterator session = _sessions.begin ();
+       session != _sessions.end ();)
+    {
+      if ((*session)->peer->peer_address != peer_address)
+        {
+          session++;
+          continue;
+        }
+
+      // Same reconnect policy as a socket-level close, so a cable that comes back is peered
+      // again rather than lost for the rest of the run.
+      if (_running && !(*session)->peer->passive)
+        {
+          NS_LOG_LOGIC ("scheduled retry in " << _error_hold.GetSeconds () << " seconds.");
+          Simulator::Schedule (_error_hold, &Bgp::ConnectPeer, this, (*session)->peer);
+        }
+
+      NS_LOG_INFO ("dropping session of AS" << (*session)->peer->peer_asn << " ("
+                                            << peer_address << ") on link-down.");
+      (*session)->Drop ();
+      session = _sessions.erase (session);
+    }
+
+  // A connect still in flight would otherwise establish over the cable that has just gone down
+  // and then have to fail on its own timers.
+  for (std::map<Ptr<Socket>, Ptr<Peer>>::iterator pending = _pending_connects.begin ();
+       pending != _pending_connects.end ();)
+    {
+      if (pending->second->peer_address == peer_address)
+        {
+          pending->first->SetConnectCallback (MakeNullCallback<void, Ptr<Socket>> (),
+                                              MakeNullCallback<void, Ptr<Socket>> ());
+          pending->first->Close ();
+          pending = _pending_connects.erase (pending);
+        }
+      else
+        {
+          pending++;
+        }
+    }
+}
+
+bool
+Bgp::RepointPeer (const Ipv4Address &from, const Ipv4Address &to)
+{
+  for (Ptr<Peer> &peer : _peers)
+    {
+      if (peer->peer_address != from)
+        {
+          continue;
+        }
+
+      // Drop first, then move. The teardown discards what this peer taught us, which is
+      // correct: that adjacency is gone. Because there is exactly one peer entry per
+      // adjacency, the discard cannot touch a session that is still up. The new session
+      // repopulates both directions when it reaches ESTABLISHED.
+      DropSessionsToPeer (from);
+      peer->peer_address = to;
+      NS_LOG_INFO ("repointed peer AS" << peer->peer_asn << " from " << from << " to " << to);
+      return true;
+    }
+  return false;
+}
+
+bool
+Bgp::ConnectPeerAddress (const Ipv4Address &peer_address)
+{
+  for (Ptr<Peer> &peer : _peers)
+    {
+      if (peer->peer_address == peer_address)
+        {
+          return ConnectPeer (peer);
+        }
+    }
+  return false;
+}
+
+void
 Bgp::HandleConnectIn (Ptr<Socket> socket, const Address &peer_addr)
 {
   NS_LOG_LOGIC ("incoming connection.");

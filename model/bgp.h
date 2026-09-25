@@ -92,6 +92,21 @@ public:
   void AddRoute (const Ipv4Address &prefix, const Ipv4Mask &mask, const Ipv4Address &nexthop);
   bool LookupRoute (const Ipv4Address &dst, Ipv4Address *nexthop, uint8_t *prefixLen,
                     Ipv4Address *srcRouterId) const;
+  // Drop any session peered at this address, as if the cable carrying it had been cut, and
+  // schedule the usual reconnect. Needed because a session only notices a dead link when its
+  // hold timer expires, and libbgp scopes its RIB by peer router ID rather than per session:
+  // with one session per cable of an adjacency, the stale session's late teardown calls
+  // dropAllRoutes() and discards the routes a newly established session has already
+  // installed for the same peer node. Dropping the stale session at the moment the link goes
+  // down puts that discard before the new session's UPDATE instead of after it.
+  void DropSessionsToPeer (const Ipv4Address &peer_address);
+  // Move a configured peer from one address to another, tearing down its session first, and
+  // start a session at the new address. Used where an adjacency's two cables carry separate
+  // subnets: one peer entry follows whichever cable is live, instead of one entry per cable.
+  // Two entries would both key on this node's single router ID, so tearing one down would
+  // discard the routes the other had installed. Returns false if no peer has that address.
+  bool RepointPeer (const Ipv4Address &from, const Ipv4Address &to);
+  bool ConnectPeerAddress (const Ipv4Address &peer_address);
   void SetLibbgpLogLevel (libbgp::LogLevel log_level);
   void SetBgpId (Ipv4Address bgp_id);
   void SetHoldTimer (Time hold_timer);
