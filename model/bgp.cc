@@ -699,7 +699,13 @@ void
 Bgp::AddRoute (libbgp::Prefix4 route, uint32_t nexthop)
 {
   NS_ASSERT (!_running);
-  _rib.insert (&_logger, route, nexthop);
+  // Locally originated routes outrank any route learned from a peer, as on real routers (Cisco
+  // gives them weight 32768). At libbgp's default weight of 0 a peer route with a configured
+  // weight won, so for a link subnet originated by both ends of the link each router preferred
+  // its neighbours' routes to its own. With libbgp sending the withdrawals RFC 4271 requires,
+  // four routers doing that formed a cycle that never converged; upstream libbgp only hid it
+  // by leaving stale routes in place.
+  _rib.insert (&_logger, route, nexthop, 32768);
 }
 
 /**
