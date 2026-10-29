@@ -14,6 +14,7 @@
 #include "bgp.h"
 #include "ns3/log.h"
 #include "ns3/enum.h"
+#include "ns3/boolean.h"
 #include "ns3/ipv4-list-routing.h"
 #include "ns3/ipv4-static-routing.h"
 #include "ns3/tcp-socket-factory.h"
@@ -32,6 +33,8 @@ Peer::Peer ()
   no_nexthop_check = false;
   forced_default_nexthop = false;
   ibgp_alter_nexthop = false;
+  igp_metric = 0;
+  mrai = Seconds (-1);
   ebgp_multihop = 1;
 }
 
@@ -84,7 +87,12 @@ Bgp::GetTypeId (void)
                          TimeValue (Seconds (1)), MakeTimeAccessor (&Bgp::_clock_interval),
                          MakeTimeChecker ())
           .AddAttribute ("ErrorHold", "Time to wait before retry.", TimeValue (Seconds (45)),
-                         MakeTimeAccessor (&Bgp::_error_hold), MakeTimeChecker ());
+                         MakeTimeAccessor (&Bgp::_error_hold), MakeTimeChecker ())
+          .AddAttribute ("RfcDecisionProcess",
+                         "Select best routes with the RFC 4271 decision process (AS_PATH length "
+                         "before EBGP over IBGP) instead of the libbgp order.",
+                         BooleanValue (false), MakeBooleanAccessor (&Bgp::_rfc_decision_process),
+                         MakeBooleanChecker ());
 
   return tid;
 }
@@ -93,6 +101,7 @@ Bgp::Bgp () : _logger ("(local)"), _rib (&_logger)
 {
   _log_level = libbgp::INFO;
   _mrai = Seconds (0);
+  _rfc_decision_process = false;
 
   _logger.setLogLevel (_log_level);
   _routing = CreateObject<BgpRouting> ();
@@ -121,6 +130,9 @@ Bgp::StartApplication (void)
   _template.rev_bus = &_bus;
   _template.rib4 = &_rib;
   _template.router_id = htonl (_bgp_id.Get ());
+  // Routes added before the start keep the libbgp order flag, but a comparison uses the RFC
+  // order as soon as either entry has it.
+  _rib.setRfcDecisionProcess (_rfc_decision_process);
   _template.use_4b_asn = true;
 
   Ptr<Ipv4> ipv4 = GetNode ()->GetObject<Ipv4> ();
@@ -528,7 +540,7 @@ Bgp::SessionInit (bool local_init, Ptr<Socket> socket)
   Ptr<BgpLog> peer_logger = Create<BgpLog> (peer_name);
   Ptr<BgpNs3SocketOut> peer_out_handler =
       Create<BgpNs3SocketOut> (socket, MakeCallback (&Bgp::HandleStateChange, this));
-  peer_out_handler->SetMrai (_mrai);
+  peer_out_handler->SetMrai (peer->mrai.IsStrictlyNegative () ? _mrai : peer->mrai);
 
   peer_logger->setLogLevel (_log_level);
 
@@ -548,6 +560,7 @@ Bgp::SessionInit (bool local_init, Ptr<Socket> socket)
   peer_config.weight = peer->weight;
   peer_config.forced_default_nexthop4 = peer->forced_default_nexthop;
   peer_config.ibgp_alter_nexthop = peer->ibgp_alter_nexthop;
+  peer_config.igp_metric = peer->igp_metric;
 
   Ptr<BgpNs3Fsm> peer_fsm = Create<BgpNs3Fsm> (peer_config);
   Ptr<Session> peer_session = Create<Session> ();

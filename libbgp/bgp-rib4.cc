@@ -55,6 +55,11 @@ uint32_t BgpRib4Entry::getNexthop() const {
 BgpRib4::BgpRib4(BgpLogHandler *logger) {
     this->logger = logger;
     update_id = 0;    
+    rfc_decision_process = false;
+}
+
+void BgpRib4::setRfcDecisionProcess(bool enabled) {
+    rfc_decision_process = enabled;
 }
 
 rib4_t::iterator BgpRib4::find_best (const Prefix4 &prefix) {
@@ -110,7 +115,7 @@ rib4_t::iterator BgpRib4::find_entry (const Prefix4 &prefix, uint32_t src) {
  * @retval <NULL, false> inserted route is not the new best, and current best
  * has not changed.
  */
-std::pair<const BgpRib4Entry*, bool> BgpRib4::insertPriv(uint32_t src_router_id, const Prefix4 &route, const std::vector<std::shared_ptr<BgpPathAttrib>> &attrib, int32_t weight, uint32_t ibgp_asn) {
+std::pair<const BgpRib4Entry*, bool> BgpRib4::insertPriv(uint32_t src_router_id, const Prefix4 &route, const std::vector<std::shared_ptr<BgpPathAttrib>> &attrib, int32_t weight, uint32_t ibgp_asn, uint32_t igp_metric) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
 
     /* construct the new entry object */
@@ -119,6 +124,8 @@ std::pair<const BgpRib4Entry*, bool> BgpRib4::insertPriv(uint32_t src_router_id,
     new_entry.weight = weight;
     new_entry.src = ibgp_asn > 0 ? SRC_IBGP : SRC_EBGP;
     new_entry.ibgp_peer_asn = ibgp_asn;
+    new_entry.igp_metric = igp_metric;
+    new_entry.rfc_decision_process = rfc_decision_process;
 
     // for logging
     const char *op = "new_entry";
@@ -250,6 +257,7 @@ const BgpRib4Entry* BgpRib4::insert(BgpLogHandler *logger, const Prefix4 &route,
     std::lock_guard<std::recursive_mutex> lock(mutex);
     new_entry.update_id = use_update_id;
     new_entry.weight = weight;
+    new_entry.rfc_decision_process = rfc_decision_process;
     if (use_update_id == update_id) update_id++;
     rib4_t::const_iterator it = rib.insert(MAKE_ENTRY4(route, new_entry));
 
@@ -290,6 +298,7 @@ const std::vector<BgpRib4Entry> BgpRib4::insert(BgpLogHandler *logger, const std
         BgpRib4Entry new_entry (route, 0, attribs);
         new_entry.update_id = update_id;
         new_entry.weight = weight;
+        new_entry.rfc_decision_process = rfc_decision_process;
         rib4_t::const_iterator isrt_it = rib.insert(MAKE_ENTRY4(route, new_entry));
         inserted.push_back(isrt_it->second);
     }
@@ -308,9 +317,9 @@ const std::vector<BgpRib4Entry> BgpRib4::insert(BgpLogHandler *logger, const std
  * @param ibgp_asn ASN of the peer if the route is from an IBGP peer. 0 if not.
  * @return <const BgpRib4Entry*, bool> entry that should be send to peer. (NULL-able)
  */
-std::pair<const BgpRib4Entry*, bool> BgpRib4::insert(uint32_t src_router_id, const Prefix4 &route, const std::vector<std::shared_ptr<BgpPathAttrib>> &attrib, int32_t weight, uint32_t ibgp_asn) {
+std::pair<const BgpRib4Entry*, bool> BgpRib4::insert(uint32_t src_router_id, const Prefix4 &route, const std::vector<std::shared_ptr<BgpPathAttrib>> &attrib, int32_t weight, uint32_t ibgp_asn, uint32_t igp_metric) {
     update_id++;
-    return insertPriv(src_router_id, route, attrib, weight, ibgp_asn);
+    return insertPriv(src_router_id, route, attrib, weight, ibgp_asn, igp_metric);
 }
 
 /**
@@ -324,12 +333,12 @@ std::pair<const BgpRib4Entry*, bool> BgpRib4::insert(uint32_t src_router_id, con
  * @return std::pair<std::vector<BgpRib4Entry>, std::vector<Prefix4>> pair of
  * vectors. <updated_entries, unchanged_entries>.
  */
-std::pair<std::vector<BgpRib4Entry>, std::vector<Prefix4>> BgpRib4::insert(uint32_t src_router_id, const std::vector<Prefix4> &routes, const std::vector<std::shared_ptr<BgpPathAttrib>> &attrib, int32_t weight,  uint32_t ibgp_asn) {
+std::pair<std::vector<BgpRib4Entry>, std::vector<Prefix4>> BgpRib4::insert(uint32_t src_router_id, const std::vector<Prefix4> &routes, const std::vector<std::shared_ptr<BgpPathAttrib>> &attrib, int32_t weight,  uint32_t ibgp_asn, uint32_t igp_metric) {
     update_id++;
     std::vector<BgpRib4Entry> updated;
     std::vector<Prefix4> unchanged;
     for (const Prefix4 &route : routes) {
-        std::pair<const BgpRib4Entry*, bool> rslt = insertPriv(src_router_id, route, attrib, weight, ibgp_asn);
+        std::pair<const BgpRib4Entry*, bool> rslt = insertPriv(src_router_id, route, attrib, weight, ibgp_asn, igp_metric);
         if (rslt.first != NULL) {
             if (!rslt.second) updated.push_back(*(rslt.first));
             else unchanged.push_back(route);

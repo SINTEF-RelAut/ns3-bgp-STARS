@@ -40,7 +40,7 @@ public:
      * source default to SRC_EBGP 
      * 
      */
-    BgpRibEntry () { src = SRC_EBGP; status = RS_ACTIVE; }
+    BgpRibEntry () { src = SRC_EBGP; status = RS_ACTIVE; igp_metric = 0; rfc_decision_process = false; }
 
     /**
      * @brief The originating BGP speaker's ID of this entry. (network bytes order)
@@ -100,15 +100,29 @@ public:
     uint32_t ibgp_peer_asn;
 
     /**
-     * @brief Test if this entry has greater weight then anoter entry. 
-     * Please note that weight are only calculated based on path attribues. 
+     * @brief ns3-bgp-STARS: cost to the nexthop inside the AS, set per session. Only used by the
+     * RFC 4271 decision process, to choose between routes learned from different IBGP peers.
+     */
+    uint32_t igp_metric;
+
+    /**
+     * @brief ns3-bgp-STARS: compare with the RFC 4271 9.1.2.2 decision process instead of the
+     * libbgp order. Set by the RIB on every entry it holds (BgpRib4::setRfcDecisionProcess).
+     */
+    bool rfc_decision_process;
+
+    /**
+     * @brief Test if this entry has greater weight then anoter entry.
+     * Please note that weight are only calculated based on path attribues.
      * (i.e., you need to compare route prefix first)
-     * 
+     *
      * @param other The other entry.
      * @return true This entry has higher weight.
      * @return false This entry has lower or equals weight.
      */
     bool operator> (const T &other) const {
+        if (rfc_decision_process || other.rfc_decision_process) return rfcPreferredOver(other);
+
         // perfer ebgp
         if (this->src > other.src) return false;
 
@@ -205,6 +219,62 @@ public:
         else if (htonl(other.src_router_id) > htonl(src_router_id)) return true;
 
         return false;
+    }
+
+private:
+    struct DecisionAttribs {
+        uint32_t local_pref = 100;
+        uint8_t as_path_len = 0;
+        uint8_t origin = 0;
+        uint32_t med = 0;
+        uint32_t neighbor_as = 0;
+    };
+
+    DecisionAttribs decisionAttribs () const {
+        DecisionAttribs d;
+        for (const std::shared_ptr<BgpPathAttrib> &attr : attribs) {
+            if (attr->type_code == MULTI_EXIT_DISC) {
+                d.med = dynamic_cast<const BgpPathAttribMed &>(*attr).med;
+            } else if (attr->type_code == ORIGIN) {
+                d.origin = dynamic_cast<const BgpPathAttribOrigin &>(*attr).origin;
+            } else if (attr->type_code == LOCAL_PREF) {
+                d.local_pref = dynamic_cast<const BgpPathAttribLocalPref &>(*attr).local_pref;
+            } else if (attr->type_code == AS_PATH) {
+                const BgpPathAttribAsPath &as_path = dynamic_cast<const BgpPathAttribAsPath &>(*attr);
+                for (const BgpAsPathSegment &seg : as_path.as_paths) {
+                    if (seg.type == AS_SEQUENCE) d.as_path_len += seg.value.size();
+                    else if (seg.type == AS_SET) d.as_path_len += 1;
+                }
+                if (as_path.as_paths.size() > 0 && as_path.as_paths.front().value.size() > 0) {
+                    d.neighbor_as = as_path.as_paths.front().value.front();
+                }
+            }
+        }
+        return d;
+    }
+
+    /**
+     * @brief ns3-bgp-STARS: RFC 4271 9.1.2.2 decision process. Strict: a > b and b > a are never
+     * both true, so the result does not depend on the order the RIB compares entries in.
+     *
+     * Order: weight (local to the speaker, as in common implementations), LOCAL_PREF, AS_PATH
+     * length, ORIGIN, MED (only between routes from the same neighbour AS), EBGP over IBGP,
+     * IGP metric to the nexthop, lowest BGP identifier, then the oldest update.
+     */
+    bool rfcPreferredOver (const T &other) const {
+        if (this->weight != other.weight) return this->weight > other.weight;
+
+        DecisionAttribs a = decisionAttribs();
+        DecisionAttribs b = other.decisionAttribs();
+
+        if (a.local_pref != b.local_pref) return a.local_pref > b.local_pref;
+        if (a.as_path_len != b.as_path_len) return a.as_path_len < b.as_path_len;
+        if (a.origin != b.origin) return a.origin < b.origin;
+        if (a.neighbor_as == b.neighbor_as && a.med != b.med) return a.med < b.med;
+        if (this->src != other.src) return this->src == SRC_EBGP;
+        if (this->igp_metric != other.igp_metric) return this->igp_metric < other.igp_metric;
+        if (this->src_router_id != other.src_router_id) return ntohl(this->src_router_id) < ntohl(other.src_router_id);
+        return this->update_id < other.update_id;
     }
 
 };

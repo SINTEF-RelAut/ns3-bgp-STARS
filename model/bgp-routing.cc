@@ -208,8 +208,11 @@ void BgpRouting::PrintRoutingTable (Ptr<OutputStreamWrapper> stream, Time::Unit 
 
     for (const std::pair<libbgp::BgpRib4EntryKey, libbgp::BgpRib4Entry> &entry_pair : _rib->get()) {
         const libbgp::BgpRib4Entry entry = entry_pair.second;
+        // ns3-bgp-STARS: mark the selected route and routes learned over iBGP.
         *os << Ipv4Address(ntohl(entry.route.getPrefix())) << "/" << (int) entry.route.getLength()
-            << " from " << Ipv4Address(ntohl(entry.src_router_id)) << std::endl
+            << " from " << Ipv4Address(ntohl(entry.src_router_id))
+            << (entry.status == libbgp::RS_ACTIVE ? " [best]" : "")
+            << (entry.src == libbgp::SRC_IBGP ? " [ibgp]" : "") << std::endl
             << "Attribues: " << std::endl;
         for (const std::shared_ptr<libbgp::BgpPathAttrib> &attr : entry.attribs) {
             attr->print(1, print_buffer, 4096);

@@ -42,6 +42,7 @@ typedef struct BgpConfig {
         weight = 0;
         no_autotick = false;
         ibgp_alter_nexthop = false;
+        igp_metric = 0;
     }
 
     /**
@@ -337,6 +338,14 @@ typedef struct BgpConfig {
      * (default: false)
      */
     bool ibgp_alter_nexthop;
+
+    /**
+     * @brief ns3-bgp-STARS: IGP metric to this peer's nexthops, stored on the routes learned from
+     * it. Only used by the RIB's RFC 4271 decision process (BgpRib4::setRfcDecisionProcess).
+     * 
+     * (default: 0)
+     */
+    uint32_t igp_metric;
 } BgpConfig;
 
 /**

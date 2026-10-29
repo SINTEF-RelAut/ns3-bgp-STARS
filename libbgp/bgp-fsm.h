@@ -196,6 +196,7 @@ private:
     std::set<std::pair<uint32_t, uint8_t>> adj_rib_out4;
     void recordSent4(const BgpUpdateMessage &update);
     void keepAnnounced4(std::vector<Prefix4> &routes) const;
+    bool withdrawAnnounced4(std::vector<Prefix4> &routes);
 
     bool rib4_local;
     bool rib6_local;

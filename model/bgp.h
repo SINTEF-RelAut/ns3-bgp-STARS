@@ -50,6 +50,8 @@ public:
   bool no_nexthop_check; //!< disable nexthop attribute validation
   bool forced_default_nexthop; //!< always use peering IP as nexthop.
   bool ibgp_alter_nexthop; //!< alter IBGP nexthop attribute the same way as EBGP.
+  uint32_t igp_metric; //!< IGP metric to this peer, used by the RFC 4271 decision process.
+  Time mrai; //!< MRAI for this session; negative (default) means the Bgp "Mrai" attribute.
 
   uint8_t ebgp_multihop;
 };
@@ -136,6 +138,7 @@ private:
   Time _mrai;
   Time _clock_interval;
   Time _error_hold;
+  bool _rfc_decision_process;
 
   BgpLog _logger;
   BgpNs3Clock _clock;

@@ -612,6 +612,11 @@ bool BgpFsm::handleRoute4AddEvent(const Route4AddEvent &ev) {
 
     logger->log(DEBUG, "BgpFsm::handleRoute4AddEvent: got route-add event with %zu routes.\n", nroutes);
 
+    // ns3-bgp-STARS: routes this session's peer no longer gets from us. An IBGP-learned best route
+    // is not sent to an IBGP peer, but the route we announced to it before is now stale. Left in
+    // place, the peer forwards to us while we forward to the IBGP next hop: a loop inside the AS.
+    std::vector<Prefix4> to_withdraw;
+
     if (ev.new_routes != NULL && ev.shared_attribs != NULL) {
         if (!ibgp || ev.ibgp_peer_asn != peer_asn) {
             BgpUpdateMessage update (logger, use_4b_asn);
@@ -638,6 +643,7 @@ bool BgpFsm::handleRoute4AddEvent(const Route4AddEvent &ev) {
             }
         } else {
             logger->log(DEBUG, "BgpFsm::handleRoute4AddEvent: ignoring new_routes in add event since remote is IBGP.\n");
+            to_withdraw.insert(to_withdraw.end(), ev.new_routes->begin(), ev.new_routes->end());
         }
     } else {
         logger->log(DEBUG, "BgpFsm::handleRoute4AddEvent: new_routes or shared_attribs is NULL.\n");
@@ -645,21 +651,20 @@ bool BgpFsm::handleRoute4AddEvent(const Route4AddEvent &ev) {
 
     if (ev.replaced_entries == NULL) {
         logger->log(DEBUG, "BgpFsm::handleRoute4AddEvent: replaced_entries is NULL.\n");
-        return true;
+        return withdrawAnnounced4(to_withdraw);
     }
 
     // consider merging of replaced_entries?
     // ns3-bgp-STARS: entries learned from this session's own peer are not sent back to it, but
     // the route we announced to it before is now stale and is withdrawn instead.
-    std::vector<Prefix4> now_peers_own;
-
     for (const BgpRib4Entry &entry : *(ev.replaced_entries)) {
         if (entry.src_router_id == peer_bgp_id) {
-            if (!ibgp) now_peers_own.push_back(entry.route);
+            to_withdraw.push_back(entry.route);
             continue;
         }
 
         if (ibgp && entry.ibgp_peer_asn == peer_asn) {
+            to_withdraw.push_back(entry.route);
             LIBBGP_LOG(logger, DEBUG) {
                 uint32_t prefix = entry.route.getPrefix();
                 char ip_str[INET_ADDRSTRLEN];
@@ -689,14 +694,17 @@ bool BgpFsm::handleRoute4AddEvent(const Route4AddEvent &ev) {
         if(!writeMessage(update)) return false;
     }
 
-    keepAnnounced4(now_peers_own);
-    if (now_peers_own.size() > 0) {
-        BgpUpdateMessage withdraw (logger, use_4b_asn);
-        withdraw.setWithdrawn4(now_peers_own);
-        if(!writeMessage(withdraw)) return false;
-    }
+    return withdrawAnnounced4(to_withdraw);
+}
 
-    return true;
+// ns3-bgp-STARS: withdraw those of the routes that the peer holds from us.
+bool BgpFsm::withdrawAnnounced4(std::vector<Prefix4> &routes) {
+    keepAnnounced4(routes);
+    if (routes.size() == 0) return true;
+
+    BgpUpdateMessage withdraw (logger, use_4b_asn);
+    withdraw.setWithdrawn4(routes);
+    return writeMessage(withdraw);
 }
 
 bool BgpFsm::handleRoute4WithdrawEvent(const Route4WithdrawEvent &ev) {
@@ -1132,7 +1140,7 @@ int BgpFsm::fsmEvalEstablished(const BgpMessage *msg) {
                     const BgpRib4Entry *best = bestEntry4(rib4, route);
                     if (best != NULL && best->src_router_id != peer_bgp_id) best_elsewhere.push_back(route);
                 }
-                rslt = rib4->insert(peer_bgp_id, routes, update->path_attribute, config.weight, ibgp ? peer_asn : 0);
+                rslt = rib4->insert(peer_bgp_id, routes, update->path_attribute, config.weight, ibgp ? peer_asn : 0, config.igp_metric);
                 for (const BgpRib4Entry &entry : rslt.first) {
                     changed_entries.push_back(entry);
                 }
@@ -1176,12 +1184,7 @@ int BgpFsm::fsmEvalEstablished(const BgpMessage *msg) {
                     }
                 }
             }
-            keepAnnounced4(now_ours);
-            if (now_ours.size() > 0 && !ibgp) {
-                BgpUpdateMessage withdraw (logger, use_4b_asn);
-                withdraw.setWithdrawn4(now_ours);
-                writeMessage(withdraw);
-            }
+            withdrawAnnounced4(now_ours);
 
             // This peer's update or withdrawal made other sources' routes the best. Every other
             // session announces them; this one has to as well.

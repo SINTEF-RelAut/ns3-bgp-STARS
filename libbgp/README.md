@@ -30,6 +30,18 @@ whose absence left stale routes behind and caused persistent forwarding loops:
    its ASN left out. Every withdrawal, upstream's own included, is limited to these, so the
    session no longer withdraws prefixes the peer never had from it.
 
+6. `BgpFsm::handleRoute4AddEvent` and `fsmEvalEstablished`: on an iBGP session, a best route
+   that is itself iBGP-learned is not sent (split horizon), but the route announced to the
+   peer before was left in place. It is now withdrawn (`BgpFsm::withdrawAnnounced4`). Without
+   it two routers of one AS each keep the other's stale route and forward between each other.
+   This is what makes a full iBGP mesh loop-free without route reflection, which libbgp lacks.
+7. `BgpRibEntry` (`bgp-rib.h`): an optional RFC 4271 9.1.2.2 decision process
+   (`BgpRib4::setRfcDecisionProcess`, off by default): weight, LOCAL_PREF, AS_PATH length,
+   ORIGIN, MED, eBGP over iBGP, IGP metric (`BgpConfig::igp_metric`, per session), BGP
+   identifier. libbgp's own order puts eBGP over iBGP first, so a router keeps a long eBGP
+   route rather than its iBGP peer's shorter one. The RFC comparison is also antisymmetric,
+   which the libbgp one is not when weights differ.
+
 IPv6 gets fix 1 only; the simulations use IPv4.
 
 A related change outside this directory: `Bgp::AddRoute` in `model/bgp.cc` originates local
